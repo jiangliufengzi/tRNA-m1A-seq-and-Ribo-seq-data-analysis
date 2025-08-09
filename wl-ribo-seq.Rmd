@@ -1,0 +1,1211 @@
+---
+title: "wanglu-redo-ribo-seq"
+author: "john"
+date: "2025-05-05"
+output: html_document
+---
+
+# 0. 初始化配置
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+library(reticulate)
+use_condaenv("C:/Users/11356/miniconda3/envs/ribo", required = TRUE)
+py_config()
+
+# set python scripts path
+py_run_string("import sys")
+py_run_string("sys.path.append('./scripts')")
+
+# load R function
+source("scripts/reverse_complement.R")
+source("scripts/read_m1a.R")
+source("scripts/pvalue.R")
+
+# other options
+options(scipen = 999)
+
+# 加载R包
+library(ggplot2)
+library(viridis)
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(tidyverse)
+library(rtracklayer)
+```
+
+# 1. 计算翻译效率
+该步骤在docker中进行，使用全部基因，多重校验更严格
+## 1.1 Xtail计算差异翻译效率
+```{r}
+# 1=control1
+# 2=t6mo1
+# 3=t61mo1
+# 4=t6mot61mo1
+# 5=control2
+# 6=t6mo2
+# 7=t61mo2
+# 8=t6mot61mo2
+
+# 计算差异翻译效率
+## 计算t6mo翻译效率
+
+# docker run -it -v M:/wanglu-Ribo-new/5_TE_calculation:/data 71208bf1e85b /bin/bash
+
+get_TE <- function(x,y,out_file){
+  library(xtail)
+  ribo <- read.table('ip_changename_counts.txt',header=T, quote='',check.names=F, sep='\t',row.names=1)
+  ribo <- ribo[,c(1,5,x,y)]
+  mrna <- read.table('input_changename_counts.txt',header=T, quote='',check.names=F, sep='\t',row.names=1)
+  mrna <- mrna[,c(1,5,x,y)]
+
+  condition <- c("control","control","treat","treat")
+
+  results <- xtail(mrna,ribo,condition,minMeanCount=1,bins=10000)
+
+  results_tab <- resultsTable(results,sort.by="pvalue.adjust",log2FCs=TRUE, log2Rs=TRUE)
+
+  write.table(results_tab,paste0(out_file,".xls"),quote=F,sep="\t")
+}
+
+get_TE(x=2,y=6,"t6mo_TE")
+get_TE(x=3,y=7,"t61mo_TE")
+get_TE(x=4,y=8,"t6mot61mo_TE")
+
+```
+
+## 1.2 提取编码基因
+```{r}
+
+# 根据gtf文件提取编码基因
+gtf <- import.gff("index/GRCz11.gtf", format = "gtf") %>% as.data.frame()
+gtf <- gtf %>% as.data.frame() %>% dplyr::filter(gene_biotype == "protein_coding") %>% 
+  dplyr::select(c("gene_id","gene_name")) %>% 
+  dplyr::distinct(gene_id,.keep_all = T)
+
+write.table(gtf, file = "index/protein_coding_genes.txt", 
+            sep = "\t", quote = F, row.names = F, col.names = T)
+
+```
+
+## 1.3 筛选编码基因输出TE
+
+```{r}
+
+get_mRNA <- function(sheet, out_file){
+  # 编码基因
+  mRNA <- read.table("index/protein_coding_genes.txt",header=T,quote="",sep="\t")
+  
+  # 从TE_file.xlsx中筛选编码基因
+  df <- readxl::read_excel("2_TE/TE_file.xlsx", sheet = sheet)
+  df[is.na(df)] = 0
+  colnames(df)
+  
+  df <- df %>% separate(gene_name, into = c("gene_id", "gene_name"), sep = "\\|", remove = F)
+  df <- df %>% dplyr::filter(gene_id %in% mRNA$gene_id)
+  
+  # 使用 | 重新合并
+  df$gene_name <- paste(df$gene_id, df$gene_name, sep = "|")
+  df <- df %>% dplyr::select(-gene_id)
+  
+  # 输出
+  write.table(df, paste0("2_TE/", out_file, "_mRNA.txt"), sep = "\t", quote = F, row.names = F)
+}
+
+get_mRNA(sheet = 1, out_file = "t6mo_TE")
+get_mRNA(sheet = 2, out_file = "t61mo_TE")
+get_mRNA(sheet = 3, out_file = "t6mot61mo_TE")
+
+```
+
+## 1.4 筛选显著的进行CDF展示
+```{r}
+# TE_file = "./TE_file.xlsx"
+# group = "t6mo_sig"
+# sheet = 1
+
+get_CDF <- function(TE_file, group, sheet){
+  # 加载R包
+  library(readxl)
+  library(ggplot2)
+  library(dplyr)
+
+  # 检查文件是否存在
+  if(!file.exists(TE_file)){
+    stop("Error: input File not found!")
+  }
+
+  if(missing(group) || is.null(group)){
+    stop("Error: outfile prefix not found!")
+  }
+
+  if(missing(sheet) || is.null(sheet)){
+    stop("Error: sheet name not found!")
+  }
+  # 读取数据
+  df <- read_excel(TE_file, sheet = sheet) %>%
+    dplyr::filter(pvalue_final >= 0.05)
+
+  df_sig <- read_excel(TE_file, sheet = sheet) %>%
+    dplyr::filter(pvalue_final < 0.05) #%>%
+    # dplyr::filter(abs(log2FC_TE_final) > 1)
+  
+  # 去除NA值
+  df <- df[complete.cases(df[c("control_log2TE", "treat_log2TE")]), ]
+  df_sig <- df_sig[complete.cases(df_sig[c("control_log2TE", "treat_log2TE")]), ]
+
+  # 检验列是否存在
+  if(!all(c("control_log2TE","treat_log2TE") %in% colnames(df))){
+    stop("Error: colum not found!")
+  }
+  df_cdf <- rbind(data.frame(logfc = df$log2FC_TE_final, category = "none_sig"),
+                  data.frame(logfc = df_sig$log2FC_TE_final, category = group))
+  df_cdf$category <- factor(df_cdf$category, levels = c("none_sig", group))
+
+  test.result <- wilcox.test(df$log2FC_TE_final, 
+                             df_sig$log2FC_TE_final,
+                             paired = FALSE, 
+                             alternative = "two.sided")$p.value
+
+  # 绘制CDF曲线
+  # colors <- setNames(c("#1C2E60", "#BD181D"), c("none_sig", group))
+  
+  colors <- setNames(c("grey", "#BD181D"), c("none_sig", group))
+  ggplot(df_cdf, aes(x=logfc, color=category)) +
+    stat_ecdf(geom = "step",
+              linewidth = 1) +  # 加粗线条，size 控制线条粗细
+    scale_color_manual(values = colors) +  # 设置自定义颜色
+    theme_classic() +
+    theme(
+      plot.title = element_text(size = 6, face = "bold"),  # 自定义标题字体大小和样式
+      axis.title = element_text(size = 6),  # 自定义轴标题字体大小
+      axis.text = element_text(size = 6),  # 自定义轴文本字体大小
+      legend.title = element_text(size = 6),  # 图例标题
+      legend.text = element_text(size = 6)  # 图例文本
+    ) +
+    labs(title="Cumulative Distribution of Translation Efficiency",
+        x="log2FoldChange (KO/Control)",
+        y="Cumulative Fraction") +
+    geom_vline(xintercept = 0, 
+               linewidth = 0.5,
+               color = "black", 
+               lty = "dashed") + 
+    xlim(-15, 15) +  # 设置X轴范围
+    annotate("text", 
+             x = -8,
+             y = 1, 
+             label = sprintf("P < %.1e", test.result),
+             hjust=0.5, 
+             vjust=1.5, 
+             size=2)  # 添加显著性注释
+
+  out_file <- paste0("2_TE/", "TE_CDF_",group,".pdf")
+  ggsave(out_file,width = 3,height = 2)
+}
+
+get_CDF(TE_file = "2_TE/TE_file.xlsx", group = "t6mo KO sig", sheet = 4)
+get_CDF(TE_file = "2_TE/TE_file.xlsx", group = "t61mo KO sig", sheet = 5)
+get_CDF(TE_file = "2_TE/TE_file.xlsx", group = "t6mo&t61mo KO sig", sheet = 6)
+
+```
+
+## 1.5 绘制TE火山图
+```{r}
+library(tidyverse)
+library(readxl)
+library(ggplot2)
+library(ggrepel)
+
+get_volcano <- function(sheet, out_file,
+                        cutoff_pvalue = 0.05, 
+                        cutoff_log2FoldChange = 1){
+  
+  df <- read_xlsx("2_TE/TE_file.xlsx",sheet = sheet) %>% as.data.frame()
+  df[is.na(df)] = 0
+  colnames(df)
+
+  # [1] "gene_name"       "mRNA_log2FC"     "RPF_log2FC"      "log2FC_TE_v1"   
+  # [5] "pvalue_v1"       "control_log2TE"  "treat_log2TE"    "log2FC_TE_v2"   
+  # [9] "pvalue_v2"       "log2FC_TE_final" "pvalue_final"    "pvalue.adjust"
+  
+  #根据阈值添加上下调分组标签
+  df$group <- ifelse(df$pvalue_final < cutoff_pvalue & df$log2FC_TE_final > cutoff_log2FoldChange, "up",
+                     ifelse(df$pvalue_final < cutoff_pvalue & df$log2FC_TE_final < -cutoff_log2FoldChange, "down", "none"))
+  
+  #转换为因子，指定绘图顺序
+  #df$'pvalue' <- df$pvalue #新增-log10pvalue
+  df$group <- factor(df$group, levels = c("up","down","none"))
+  
+  df <- df %>% separate(gene_name,c("gene_id","gene_name"),sep = "\\|")
+  
+  #自定义颜色：
+  mycol <- c("#EB4232","#2E9FDF","#d8d8d8")
+  #自定义主题：
+  mytheme <- theme_classic() +
+    theme(axis.title = element_text(size = 15),
+          axis.text = element_text(size = 14),
+          legend.text = element_text(size = 14),
+          plot.margin = margin(15,5.5,5.5,5.5))
+  
+  up_or_down <- table(df$group)
+  # up  down  none 
+  # 147   432 11896
+  
+  up_num <- up_or_down["up"]
+  down_num <- up_or_down["down"]
+  print(up_num)
+  print(down_num)
+  
+  #ggplot2绘制火山图：
+  x_lim <- c(min(df$log2FC_TE_final)-2, max(df$log2FC_TE_final)+2)
+  p <- ggplot(data = df, 
+              aes(x = log2FC_TE_final,
+                  y = -log10(pvalue_final), 
+                  color = group)) +  #建立映射
+    geom_point(size = 2.2) +  #绘制散点
+    scale_colour_manual(name = "", values = alpha(mycol, 0.7)) +  #自定义散点颜色
+    scale_x_continuous(limits = x_lim,  #设置横坐标刻度
+                       breaks = c(-5, seq(-5, 5, by = 2)),  # 正负5处添加横坐标标签
+                       labels = c("-5", as.character(seq(-5, 5, by = 2)))) +
+    scale_y_continuous(expand = expansion(add = c(2, 0)),
+                       limits = c(0, 30),
+                       breaks = c(0, seq(0, 30, by = 5)),  # 添加纵坐标标签
+                       labels = c("0", as.character(seq(0, 30, by = 5)))) +
+    geom_hline(yintercept = -log10(cutoff_pvalue), 
+               size = 0.7,
+               color = "black",
+               lty = "dashed") +  #水平阈值
+    geom_vline(xintercept = c(-cutoff_log2FoldChange,
+                              cutoff_log2FoldChange),
+               size = 0.7, 
+               color = "black",
+               lty = "dashed") + 
+    annotate("text",x= -6,y= 27,label=down_num,size=8) +
+    annotate("text",x= 6,y= 27,label=up_num,size=8) +
+    mytheme
+  
+  # 蛋白质组下调基因列表
+  proteome <- read_excel("1_proteome/proteome_sig.xlsx") %>% 
+    dplyr::filter(Significant == "Down")
+  
+  te_sig_gene <- df %>% filter(group == "down") %>%
+    dplyr::pull(gene_name)
+  
+  intersect <- intersect(te_sig_gene, proteome$gene_name)
+  
+  target <- filter(df,gene_name %in% intersect) %>% 
+    distinct(gene_name, .keep_all = T)
+  
+  up <- filter(target, log2FC_TE_final > 0)
+  down <- filter(target, log2FC_TE_final < 0)
+  
+  #个性化调整：对齐目标标签
+  p5 <- p +
+    geom_point(data = down,
+               aes(x = log2FC_TE_final, y = -log10(pvalue_final)),
+               color = 'black', size = 4.5, alpha = 0.2) +
+    geom_text_repel(data = down,
+                    aes(x = log2FC_TE_final, y = -log10(pvalue_final), label = gene_name),
+                    seed = 233,
+                    size = 3.5,
+                    color = 'black',
+                    min.segment.length = 0,
+                    max.overlaps = Inf,
+                    segment.linetype = 3,
+                    segment.color = 'black',
+                    segment.alpha = 0.5,
+                    nudge_x = min(df$log2FC_TE_final)-1 - down$log2FC_TE_final,
+                    nudge_y = 5.5,  # 增加 y 轴的 nudge 值
+                    direction = "y",
+                    hjust = 0) +
+    labs(x = "log2FC_TE_final", y = "-log10(pvalue)")
+  
+  p6 <- p5 +
+    geom_point(data = up,
+               aes(x = log2FC_TE_final, y = -log10(pvalue_final)),
+               color = 'black', size = 4.5, alpha = 0.2) +
+    geom_text_repel(data = up,
+                    aes(x = log2FC_TE_final, y = -log10(pvalue_final), label = gene_name),
+                    seed = 233,
+                    size = 3.5,
+                    color = 'black',
+                    min.segment.length = 0,
+                    max.overlaps = Inf,
+                    segment.linetype = 3,
+                    segment.color = 'black',
+                    segment.alpha = 0.5,
+                    nudge_x = max(df$log2FC_TE_final)+1 - up$log2FC_TE_final,
+                    nudge_y = 7.5,  # 增加 y 轴的 nudge 值
+                    direction = "y",
+                    hjust = 0) +
+    labs(x = "log2FC_TE_final", y = "-log10(pvalue)")
+  
+  ggsave(out_file, p6, width = 7, height = 6)
+}
+
+get_volcano(sheet = 4, out_file = "2_TE/t6mo_TE_diff_volcano_p0.05.pdf")
+
+get_volcano(sheet = 5, out_file = "2_TE/t61mo_TE_diff_volcano_p0.05.pdf")
+
+get_volcano(sheet = 6, out_file = "2_TE/t6mot61mo_TE_diff_volcano_p0.05.pdf")
+
+```
+
+
+# 2. gene codon usage
+## 2.1 获取最长转录本信息
+```{python}
+from longest_cds_transcripts import enhanced_transcript_analysis
+
+enhanced_transcript_analysis(by="cds", 
+                             fasta_file="index/GRCz11.fasta", 
+                             db_file="index/GRCz11_gtf.db", 
+                             out_fasta="index/GRCz11_longest_cds_transcripts.fasta",
+                             out_info="index/GRCz11_longest_cds_transcripts.csv")
+                             
+```
+
+## 2.2 计算密码子频数
+取TE上下调基因的top300进行计算
+```{r, warning=FALSE}
+
+library(tidyverse)
+library(readxl)
+
+# 定义函数
+get_up_down_gene <- function(sheet = 5,
+                             top = 300,
+                             FC_cut = 0,
+                             pvalue_cut = 0.05){
+  # 读取数据
+  df <- read_excel("./2_TE/TE_file.xlsx", sheet = sheet) %>%
+    dplyr::rename(pvalue = pvalue_final,
+                  log2FC = log2FC_TE_final)
+  
+  # 筛选上下调基因
+  down_gene_name <- df %>%
+    tidyr::separate(gene_name, into = c("gene_id", "gene_name"), sep = "\\|") %>%
+    dplyr::filter(log2FC < -FC_cut) %>% 
+    dplyr::filter(pvalue < pvalue_cut) %>%
+    dplyr::filter(gene_name != "0") %>%
+    dplyr::top_n(-top, log2FC) %>%
+    dplyr::pull(gene_name) %>% unique()
+  
+  up_gene_name <- df %>%
+    tidyr::separate(gene_name, into = c("gene_id", "gene_name"), sep = "\\|") %>%
+    dplyr::filter(log2FC > FC_cut) %>% 
+    dplyr::filter(pvalue < pvalue_cut) %>%
+    dplyr::filter(gene_name != "0") %>%
+    dplyr::top_n(top, log2FC) %>%
+    dplyr::pull(gene_name) %>% unique()
+  
+  # 将变量传递给python
+  py$down_gene_name <- down_gene_name %>% as.list()
+  py$up_gene_name <- up_gene_name %>% as.list()
+}
+
+get_up_down_gene(sheet = 5, top = 300, FC_cut = 0, pvalue_cut = 0.05)
+
+```
+
+```{python}
+
+from bam_file_cds_codon_usage import output_codon
+
+down_df = output_codon(input_dir="3_TE_peak",
+                 gene_list=down_gene_name,
+                 fasta_file='index/GRCz11.fasta',
+                 cds_info_file='index/GRCz11_longest_cds_transcripts.csv',
+                 out_codon_usage_file='./3_TE_peak/down_codon_usage_top300.xlsx')
+
+up_df = output_codon(input_dir="3_TE_peak",
+                 gene_list=up_gene_name,
+                 fasta_file='index/GRCz11.fasta',
+                 cds_info_file='index/GRCz11_longest_cds_transcripts.csv',
+                 out_codon_usage_file='./3_TE_peak/up_codon_usage_top300.xlsx')
+
+all_gene_codon = output_codon(input_dir="3_TE_peak",
+                 gene_list=None,
+                 fasta_file='index/GRCz11.fasta',
+                 cds_info_file='index/GRCz11_longest_cds_transcripts.csv',
+                 out_codon_usage_file='./3_TE_peak/all_codon_usage.xlsx')
+
+```
+
+## 2.3 计算使用率变化
+```{r}
+library(tibble)
+library(dplyr)
+
+up_df <- py$up_df
+down_df <- py$down_df
+all_gene_codon <- py$all_gene_codon
+
+# 行名改为列
+up_df <- up_df %>%
+  rownames_to_column(var = "codon") %>%
+  mutate(up = (t61mo_ko_rep1 + t61mo_ko_rep2) / 2) %>% 
+  dplyr::select(codon, up)
+
+down_df <- down_df %>%
+  rownames_to_column(var = "codon") %>%
+  mutate(down = (t61mo_ko_rep1 + t61mo_ko_rep2) / 2) %>% 
+  dplyr::select(codon, down)
+
+all_gene_codon <- all_gene_codon %>%
+  rownames_to_column(var = "codon") %>%
+  mutate(all = (t61mo_ko_rep1 + t61mo_ko_rep2) / 2) %>% 
+  dplyr::select(codon, all)
+
+df <- all_gene_codon %>%
+  left_join(up_df, by = "codon") %>%
+  left_join(down_df, by = "codon") %>%
+  dplyr::filter(codon != "TAG" & codon != "TAA" & codon != "TGA") %>%
+  mutate(up_p = up / sum(up) * 100,
+         down_p = down / sum(down) * 100,
+         all_p = all / sum(all) * 100) %>%
+  dplyr::select(codon, up_p, down_p, all_p)
+
+# 输出结果
+write.table(df, "./3_TE_peak/TE_diff_fc_top300_codon_use_ratio_peak.txt", 
+            sep="\t",
+            quote=FALSE, 
+            row.names=FALSE)
+
+```
+
+## 2.4 密码子百分比与m1A使用
+```{r}
+
+library(tidyverse)
+library(ggplot2)
+
+m1a <- read_m1a()# %>% dplyr::filter(t61_mean_diff > 0.05)
+
+codon_use <- read.table("./3_TE_peak/TE_diff_fc_top300_codon_use_ratio_peak.txt", sep="\t", header=TRUE)
+colnames(codon_use) <- c("codon", "up_ratio", "down_ratio", "all_ratio")
+
+df <- m1a %>% left_join(codon_use, by = "codon")
+
+df <- df %>% dplyr::filter(t61mo_mean_diff > 0)# %>% dplyr::top_n(43, t61_mean_diff)
+
+p_calculate <- df %>% dplyr::select(c(down_ratio, up_ratio)) %>%
+  apply(.,1,function(x) (x / sum(x)) * 100) %>% t() %>% as.data.frame()
+pvalue <- t.test(p_calculate$down_ratio, p_calculate$up_ratio, paired = TRUE, alternative = "greater")
+
+df$down_ratio <- p_calculate$down_ratio
+df$up_ratio <- p_calculate$up_ratio
+
+df_bar <- pivot_longer(df, 
+                       cols = c("down_ratio", "up_ratio"), 
+                       names_to = "type", 
+                       values_to = "ratio")
+
+df$seqname <- factor(df$seqname, levels = df$seqname[order(df$t61mo_mean_diff)])
+df_bar$type <- factor(df_bar$type, levels = c("down_ratio", "up_ratio"))
+df_bar$seqname <- factor(df_bar$seqname, levels = df$seqname[order(df$t61mo_mean_diff)])
+
+# pvalue <- t.test(df$down_ratio, df$up_ratio, paired = TRUE, alternative = "greater")
+
+color_values <- setNames(c('#D55E00', '#009E73'), c("down_ratio", "up_ratio"))
+
+library(ggnewscale)
+p1 <- ggplot() +
+  geom_vline(data = df, 
+           aes(xintercept = as.numeric(factor(seqname))),
+           linetype = "dashed",
+           color = "gray", 
+           alpha = 0.6) +
+
+  geom_bar(data = df_bar,
+         aes(x = seqname, y = ratio, fill = type),
+         alpha = 0.7,
+         position = "dodge", stat = "identity") +
+  scale_fill_manual(values = color_values) +
+
+  new_scale_fill() +
+  
+  geom_point(data = df, 
+           aes(x = seqname, y = t61mo_mean_diff * 350, fill = t61mo_mean_diff), 
+           shape = 21, 
+           alpha = 1,
+           size = 2.8) +
+  scale_fill_viridis_c(option = "D",
+                   limits = c(min(df$t61mo_mean_diff),
+                              max(df$t61mo_mean_diff)),
+                   name = "Diff",
+                   direction = -1) +
+  scale_y_continuous(sec.axis = sec_axis(~ . / 350,
+                                   name = "tRNA m1A level Diff (WT-KO) %"),
+               breaks = c(10, 30, 50, 70, 90),
+               labels = c("10", "30", "50", "70", "90")) +
+  
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 7, color = "black", face = "bold"),
+    axis.text.y = element_text(size = 7, color = "black", face = "bold"),
+    axis.line = element_line(color = "black", linewidth = 0.25),
+    legend.title = element_text(size = 10),
+    panel.border = element_rect(color = "black", 
+                                fill = NA, 
+                                linewidth = 0.5)
+  ) +
+  labs(title = "t61mo KO m1A level change in tRNA",
+       x = "tRNA",
+       y = "Codon percentage") +
+  annotate("text", 
+           x = 28, 
+           y = 80, 
+           label = paste0("p-value=", round(pvalue$p.value, 4)), 
+           size = 4, 
+           color = "black")
+
+
+p1
+
+ggsave(p1, filename = "./3_TE_peak/tRNA_m1A_diff_TE_top300_peak_codon_use.pdf", width = 8, height = 4)
+
+############################################################
+# 再使用ggplot2绘制一个箱线图
+############################################################
+library(ggplot2)
+library(ggpubr)
+library(dplyr)
+library(ggsignif)
+library(cowplot)
+
+data <- df_bar %>% dplyr::select(c(type, ratio))
+colnames(data) <- c("group", "value")
+
+p_value <- pvalue$p.value
+
+stat_summary <- data %>%
+  group_by(group) %>%
+  summarise(
+    mean = mean(value),
+    sd = sd(value),
+    se = sd / sqrt(n()),
+    # 添加 ymin 和 ymax 列
+    ymin = mean - se,
+    ymax = mean + se
+  )
+
+ggplot(data, aes(x = group, y = value, fill = group)) +
+  geom_boxplot(alpha = 0.7, width = 0.5, outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.5, size = 2) +
+  
+  # 添加均值和误差线
+  geom_point(data = stat_summary, aes(y = mean),
+            size = 3, shape = 18, color = "black") +
+  geom_errorbar(data = stat_summary,
+                aes(y = mean, ymin = ymin, ymax = ymax),
+                width = 0.2) +
+  
+  # 添加p值标注
+  annotate("text", x = 1.5, y = max(data$value)*1.1,
+           label = paste("p =", format(p_value, digits = 3))) +
+  
+  # 设置颜色
+  scale_fill_manual(values = c("#00BFC4", "#F8766D")) +
+  
+  labs(title = "m1A reduce in tRNA usage in TE Down and Up gene",
+       x = "group",
+       y = "codon percentage in TE down and up gene") +
+  
+  # 添加统计显著性标记
+  geom_signif(
+    comparisons = list(c("down_gene_codon", "up_gene_codon")),
+    map_signif_level = TRUE,
+    y_position = max(data$value)*1.1
+  ) +
+  
+  # 设置主题和标签
+  # theme_classic() +
+  
+  # 自定义主题设置实现 half_open 效果
+  theme(
+    # 标题和轴标签设置
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10),
+    
+    # 去除图例
+    legend.position = "none",
+    
+    # 网格线设置
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    
+    # 边框设置
+    axis.line = element_line(colour = "black", linewidth = 0.5),
+    axis.line.x = element_line(colour = "black", linewidth = 0.5),
+    axis.line.y = element_line(colour = "black", linewidth = 0.5),
+    
+    # 去除右边和上边的轴线
+    axis.line.right = element_blank(),
+    axis.line.top = element_blank(),
+    
+    # 去除刻度线
+    axis.ticks.length = unit(0.15, "cm"),
+    axis.ticks = element_line(colour = "black", linewidth = 0.5),
+    
+    # 调整绘图区域边距
+    plot.margin = unit(c(0.5, 0.5, 0.5, 0.5), "cm"),
+    
+    # 设置背景
+    panel.background = element_rect(fill = "white", colour = NA),
+    plot.background = element_rect(fill = "white", colour = NA)
+  )
+
+ggsave(filename = "./3_TE_peak/tRNA_m1A_diff_TE_top300_peak_codon_use_boxplot.pdf", width = 4, height = 4)
+
+```
+
+# 5. 绘制密码子使用图
+```{r}
+library(ggplot2)
+library(rio)
+library(ggsci)
+library(scales)
+library(dplyr)
+library(ggtext)
+library(Biostrings)
+
+########################################
+# 获取密码子表
+########################################
+codon_table <- GENETIC_CODE
+
+codon_df <- data.frame(
+  codon = names(codon_table),  # 密码子
+  amino_acid = unname(codon_table),  # 氨基酸
+  stringsAsFactors = FALSE
+)
+
+########################################
+# 整理密码子使用数据
+########################################
+df <- read.table("./3_TE_peak/TE_diff_fc_top300_codon_use_ratio_peak.txt", sep="\t", header=TRUE)
+colnames(df) <- c("codon", "up_ratio", "down_ratio", "all_ratio")
+
+p_calculate <- df %>% dplyr::select(c(down_ratio, up_ratio)) %>%
+  apply(.,1,function(x) (x / sum(x)) * 100) %>% t() %>% as.data.frame()
+
+df$down_ratio <- p_calculate$down_ratio
+df$up_ratio <- p_calculate$up_ratio
+
+df <- dplyr::left_join(df, codon_df, by = c("codon" = "codon"))
+df$ratio_change <- (df$down_ratio - df$up_ratio) * 0.3 # 避免绘图柱子太高
+
+# 数据集
+data <- data.frame(
+  animo = df$amino_acid,
+  codon = df$codon,
+  value = df$ratio_change
+)
+
+data <- data %>% arrange(animo, codon) %>% 
+  mutate(codon = factor(codon, levels = unique(codon)))
+
+for (i in unique(data$animo)) {
+  pos_index <- which(data$animo %in% i)
+  pos <- pos_index[length(pos_index)]
+  tmp <- data.frame(animo = i,codon = paste0(i,"-NULL"), value = 0)
+  data <- rbind(data[1:pos,],tmp,data[pos+1:nrow(data),])
+}
+
+data <- data[!is.na(data$animo),]
+
+data <- data %>% arrange(animo, codon) %>% 
+  mutate(codon = factor(codon, levels = unique(codon)))
+
+########################################
+# 计算每个标签的角度
+########################################
+data <- data %>%
+  mutate(angle = 90 - 360 * (as.numeric(factor(codon)) - 0.5) / n())
+
+########################################
+# 计算每种氨基酸对应的线段起始和终止位置
+########################################
+animo_acid_positions <- data %>%
+  group_by(animo) %>%
+  summarise(
+    start = min(as.numeric(codon)),
+    end = max(as.numeric(codon)) - 1,
+    mid = (min(as.numeric(codon)) + max(as.numeric(codon))) / 2
+  )
+
+########################################
+# 颜色映射
+########################################
+color_map <- pal_d3("category20", alpha = 0.9)(length(unique(data$animo)))
+names(color_map) <- unique(data$animo)
+
+# 将含有NULL的标签去掉
+# for (i in 1:nrow(data)) {
+#   if (grepl("NULL$", data[i,2])) {
+#     data[i,2]=NA
+#   }
+# }
+
+########################################
+# 绘制包含正负值的柱状图
+########################################
+ggplot(data, aes(x = codon, y = value, fill = animo)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(aes(y = 26, label = codon), 
+            color = "black",
+            position = position_dodge(width = 1), 
+            size = 2.5, 
+            angle = data$angle) +
+  scale_y_continuous(breaks = c(-25, 0, 15), 
+                    limits = c(-70, 30)) +  # Combined scale settings
+  coord_polar(theta = "x", start = 0) +
+  labs(title = "Up and Down Values Bar Chart",
+       x = "codon",
+       y = "Value") +
+  scale_fill_manual(values = color_map) +  # 手动设置颜色
+  scale_color_manual(values = color_map) +
+  theme_void() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks = element_blank(),
+        axis.line.x = element_blank(),  # 隐藏横坐标轴线
+        panel.grid.major.x = element_blank(),  # 隐藏横坐标的主要网格线
+        # panel.grid.major.y = element_line(color = "grey80", size = 0.5),  # 显示纵坐标的主要网格线
+        panel.grid.minor = element_blank()) +
+  geom_segment(data = animo_acid_positions, 
+               aes(x = start, xend = end, y = -26, yend = -26, color = animo),
+               linewidth = 1) +  # 添加线段
+  geom_text(data = animo_acid_positions,
+            aes(x = mid, y = -35, label = animo), color = "black",
+            vjust = 1, hjust = 0.5, size = 3)  # 添加注释
+
+ggsave(filename = "4_TE_up_down_gene_codon_usage/codon_use_down.pdf",
+        height = 5,
+        width = 5,
+        limitsize = FALSE)
+
+```
+
+# 7. fech基因
+## 7.1 统计密码子频数
+```{python}
+from gene_codon_usage import get_codon_use
+
+
+for gene in ["fech", "nrf1", "ndufb7"]:
+
+  fech = get_codon_use(gene, input_fasta="index/GRCz11_longest_cds_transcripts.fasta")
+  
+  # 重命名列名
+  fech.rename(columns={"count": f"{gene}_Count"}, inplace=True)
+  
+  # 填充 NaN 值为 0
+  fech.fillna(0, inplace=True)
+  
+  # 打印合并后的数据框
+  print(fech)
+  
+  fech.to_csv(f"./6_fech/{gene}_codon_use.txt", sep='-', index=False)
+
+```
+
+## 7.2 计算使用率变化
+```{r}
+library(rio)
+library(dplyr)
+
+# 读取合并后的密码子使用数据
+df <- read.table("./6_fech/fech_codon_use.txt", sep="-", header=TRUE) %>% 
+  dplyr::filter(Amino.Acid != "Unknown") %>%
+  mutate(fech_ratio = (fech_Count / sum(fech_Count)) * 100)
+
+# 输出结果
+write.table(df, "./6_fech/fech_codon_use_ratio.txt", 
+            sep="\t",
+            quote=FALSE, 
+            row.names=FALSE)
+
+
+library(rio)
+library(dplyr)
+
+# 读取合并后的密码子使用数据
+df <- read.table("./6_fech/nrf1_codon_use.txt", sep="-", header=TRUE) %>% 
+  dplyr::filter(Amino.Acid != "Unknown") %>%
+  mutate(nrf1_ratio = (nrf1_Count / sum(nrf1_Count)) * 100)
+
+# 输出结果
+write.table(df, "./6_fech/nrf1_codon_use_ratio.txt", 
+            sep="\t",
+            quote=FALSE, 
+            row.names=FALSE)
+
+
+library(rio)
+library(dplyr)
+
+# 读取合并后的密码子使用数据
+df <- read.table("./6_fech/ndufb7_codon_use.txt", sep="-", header=TRUE) %>% 
+  dplyr::filter(Amino.Acid != "Unknown") %>%
+  mutate(ndufb7_ratio = (ndufb7_Count / sum(ndufb7_Count)) * 100)
+
+# 输出结果
+write.table(df, "./6_fech/ndufb7_codon_use_ratio.txt", 
+            sep="\t",
+            quote=FALSE, 
+            row.names=FALSE)
+
+
+```
+
+## 7.3 fech密码子百分比与m1A使用
+```{r}
+
+m1a <- read_m1a()# %>% dplyr::filter(t61_mean_diff > 0.05)
+
+codon_use <- read.table("./6_fech/fech_codon_use_ratio.txt", sep="\t", header=TRUE)
+
+df <- m1a %>% left_join(codon_use, by = "codon")
+
+df <- df %>% dplyr::filter(t61mo_mean_diff > 0)
+
+p1 <- ggplot(df) +
+  geom_vline(aes(xintercept = as.numeric(factor(seqname))),
+             linetype = "dashed",
+             color = "gray", 
+             alpha = 0.6) +
+  geom_col(aes(x = reorder(seqname, t61mo_mean_diff),
+               y = fech_ratio),
+               fill = "gray",
+               alpha = 0.5,
+               position = "stack") +
+  geom_point(aes(x = reorder(seqname, t61mo_mean_diff), 
+                 y = t61mo_mean_diff*30,
+                 fill = t61mo_mean_diff), 
+                 shape = 21, 
+                 alpha = 1,
+                 size = 2.8) +
+  scale_fill_viridis(option = "D",
+                 limits = c(min(df$t61mo_mean_diff),
+                            max(df$t61mo_mean_diff)),
+                 name = "Diff",
+                 direction = -1) +
+  scale_y_continuous(sec.axis = sec_axis(~./30,
+                                         name = "tRNA m1A level Diff (WT-KO) %"),
+                                         breaks = 1:7,
+                                         labels = c("1", "2", "3", "4", "5", "6", "7")) +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 7, color = "black", face = "bold"),
+    axis.text.y = element_text(size = 12, color = "black"),
+    legend.title = element_text(size = 10)
+  ) +
+  labs(title = "t61mo KO m1A level change in tRNA",
+       x = "tRNA",
+       y = "codon usage percent") +  # 使用 labs() 设置图例标题
+  theme(panel.border = element_rect(color = "black", 
+                                    fill = NA, 
+                                    linewidth = 1))# +
+  # annotate("text", 
+  #         x = 20, 
+  #         y = max(df$t61_mean_diff)*1.05, 
+  #         label = paste0("p-value=", round(pvalue$p.value, 4)), 
+  #         size = 4, 
+  #         color = "black")
+
+p1
+
+ggsave(p1, filename = "./6_fech/tRNA_m1A_diff_fech_gene_codon_use.pdf", width = 8, height = 4)
+
+```
+
+## 7.4 绘制箱线图
+```{r}
+
+library(tidyverse)
+library(ggplot2)
+# load R function
+source("scripts/reverse_complement.R")
+source("scripts/read_m1a.R")
+source("scripts/pvalue.R")
+
+
+m1a <- read_m1a()# %>% dplyr::filter(t61_mean_diff > 0.05)
+
+codon_use <- read.table("./3_TE_peak/TE_diff_fc_top300_codon_use_ratio_peak.txt", sep="\t", header=TRUE)
+colnames(codon_use) <- c("codon", "up_ratio", "down_ratio", "all_ratio")
+
+fech_codon_use <- read.table("./6_fech/fech_codon_use_ratio.txt", sep = "\t", header=TRUE) %>% 
+  dplyr::select(c("codon", "fech_ratio"))
+
+nrf1_codon_use <- read.table("./6_fech/nrf1_codon_use_ratio.txt", sep = "\t", header=TRUE) %>% 
+  dplyr::select(c("codon", "nrf1_ratio"))
+
+ndufb7_codon_use <- read.table("./6_fech/ndufb7_codon_use_ratio.txt", sep = "\t", header=TRUE) %>% 
+  dplyr::select(c("codon", "ndufb7_ratio"))
+
+# 合并数据
+df <- m1a %>% left_join(codon_use, by = "codon") %>% left_join(fech_codon_use, by = "codon") %>% 
+  left_join(nrf1_codon_use, by = "codon") %>% left_join(ndufb7_codon_use, by = "codon")
+
+df <- df %>% dplyr::filter(t61mo_mean_diff > 0)# %>% dplyr::top_n(43, t61_mean_diff)
+df[is.na(df)]=0
+
+###############################################################
+# 与up组相对比，计算p值
+p_down_vs_up <- df %>% dplyr::select(c(down_ratio, up_ratio)) %>%
+  apply(.,1,function(x) (x / sum(x)) * 100) %>% t() %>% as.data.frame()
+p_downup <- t.test(p_down_vs_up$down_ratio, p_down_vs_up$up_ratio, paired = TRUE, alternative = "greater")
+
+p_fech_vs_up <- df %>% dplyr::select(c(fech_ratio, up_ratio)) %>%
+  apply(.,1,function(x) (x / sum(x)) * 100) %>% t() %>% as.data.frame()
+p_fechup <- t.test(p_fech_vs_up$fech_ratio, p_fech_vs_up$up_ratio, paired = TRUE, alternative = "greater")
+
+p_nrf1_vs_up <- df %>% dplyr::select(c(nrf1_ratio, up_ratio)) %>%
+  apply(.,1,function(x) (x / sum(x)) * 100) %>% t() %>% as.data.frame()
+p_nrf1up <- t.test(p_nrf1_vs_up$nrf1_ratio, p_nrf1_vs_up$up_ratio, paired = TRUE, alternative = "greater")
+
+p_ndufb7_vs_up <- df %>% dplyr::select(c(ndufb7_ratio, up_ratio)) %>%
+  apply(.,1,function(x) (x / sum(x)) * 100) %>% t() %>% as.data.frame()
+p_ndufb7up <- t.test(p_ndufb7_vs_up$ndufb7_ratio, p_ndufb7_vs_up$up_ratio, paired = TRUE, alternative = "greater")
+
+###############################################################
+
+df$down_ratio <- p_fech_vs_up$fech_ratio
+df$up_ratio <- p_fech_vs_up$up_ratio
+p_value <- p_fechup$p.value
+
+# df$down_ratio <- p_nrf1_vs_up$nrf1_ratio
+# df$up_ratio <- p_nrf1_vs_up$up_ratio
+# p_value <- p_nrf1up$p.value
+
+# df$down_ratio <- p_ndufb7_vs_up$ndufb7_ratio
+# df$up_ratio <- p_ndufb7_vs_up$up_ratio
+# p_value <- p_ndufb7up$p.value
+
+df_bar <- pivot_longer(df, 
+                       cols = c("down_ratio", "up_ratio"), 
+                       names_to = "type", 
+                       values_to = "ratio")
+
+df$seqname <- factor(df$seqname, levels = df$seqname[order(df$t61mo_mean_diff)])
+df_bar$type <- factor(df_bar$type, levels = c("down_ratio", "up_ratio"))
+df_bar$seqname <- factor(df_bar$seqname, levels = df$seqname[order(df$t61mo_mean_diff)])
+
+# pvalue <- t.test(df$down_ratio, df$up_ratio, paired = TRUE, alternative = "greater")
+
+color_values <- setNames(c('#D55E00', '#009E73'), c("down_ratio", "up_ratio"))
+
+############################################################
+# 再使用ggplot2绘制一个箱线图
+############################################################
+library(ggplot2)
+library(ggpubr)
+library(dplyr)
+library(ggsignif)
+library(cowplot)
+
+data <- df_bar %>% dplyr::select(c(type, ratio))
+colnames(data) <- c("group", "value")
+
+stat_summary <- data %>%
+  group_by(group) %>%
+  summarise(
+    mean = mean(value),
+    sd = sd(value),
+    se = sd / sqrt(n()),
+    # 添加 ymin 和 ymax 列
+    ymin = mean - se,
+    ymax = mean + se
+  )
+
+ggplot(data, aes(x = group, y = value, fill = group)) +
+  geom_boxplot(alpha = 0.7, width = 0.5, outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.5, size = 2, shape = 16) +
+  
+  # 添加均值和误差线
+  geom_point(data = stat_summary, aes(y = mean),
+            size = 3, shape = 18, color = "black") +
+  geom_errorbar(data = stat_summary,
+                aes(y = mean, ymin = ymin, ymax = ymax),
+                width = 0.2) +
+  
+  # 添加p值标注
+  annotate("text", x = 1.5, y = max(data$value)*1.1,
+           label = paste("p =", format(p_value, digits = 3))) +
+  
+  # 设置颜色
+  scale_fill_manual(values = c("#00BFC4", "#F8766D")) +
+  
+  labs(title = "m1A reduce in tRNA usage in TE Down and Up gene",
+       x = "group",
+       y = "codon percentage in TE down and up gene") +
+  
+  # 添加统计显著性标记
+  geom_signif(
+    comparisons = list(c("down_gene_codon", "up_gene_codon")),
+    map_signif_level = TRUE,
+    y_position = max(data$value)*1.1
+  ) +
+  
+  # 设置主题和标签
+  # theme_classic() +
+  
+  # 自定义主题设置实现 half_open 效果
+  theme(
+    # 标题和轴标签设置
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10),
+    
+    # 去除图例
+    legend.position = "none",
+    
+    # 网格线设置
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    
+    # 边框设置
+    axis.line = element_line(colour = "black", linewidth = 0.5),
+    axis.line.x = element_line(colour = "black", linewidth = 0.5),
+    axis.line.y = element_line(colour = "black", linewidth = 0.5),
+    
+    # 去除右边和上边的轴线
+    axis.line.right = element_blank(),
+    axis.line.top = element_blank(),
+    
+    # 去除刻度线
+    axis.ticks.length = unit(0.15, "cm"),
+    axis.ticks = element_line(colour = "black", linewidth = 0.5),
+    
+    # 调整绘图区域边距
+    plot.margin = unit(c(0.5, 0.5, 0.5, 0.5), "cm"),
+    
+    # 设置背景
+    panel.background = element_rect(fill = "white", colour = NA),
+    plot.background = element_rect(fill = "white", colour = NA)
+  )
+
+ggsave(filename = "./6_fech/tRNA_m1A_diff_TE_top300_peak_codon_use_boxplot_fech.pdf", width = 4, height = 4)
+
+```
+
+
+# 8. GSEA分析
+```{r}
+library(clusterProfiler)
+library(org.Dr.eg.db)
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ReactomePA)
+library(openxlsx)
+library(enrichplot)
+
+gmt <- "./7_GSEA/wikipathways-20250510-gmt-Danio_rerio.gmt"
+wp <- read.gmt.wp(gmt)
+
+get_gsea <- function(sheet){
+  diff <- readxl::read_excel("./2_TE/TE_file.xlsx", sheet = sheet) %>% 
+    tidyr::separate(`gene_id|gene_name`, into = c("gene_id", "gene_name"), sep = "\\|") %>%
+    dplyr::filter(gene_name != "0") %>%
+    dplyr::select(gene_id, log2FC_TE_final) %>%
+    dplyr::arrange(desc(log2FC_TE_final))
+  
+  df <- diff %>%
+  mutate(
+    ENTREZID = clusterProfiler::bitr(
+      gene_id,
+      fromType = "ENSEMBL",
+      toType = "ENTREZID",
+      OrgDb = org.Dr.eg.db
+    )$ENTREZID
+  )
+  
+  # 清除含有NA的行
+  df <- df %>% dplyr::filter(!is.na(ENTREZID)) %>% 
+    dplyr::filter(!is.na(log2FC_TE_final))
+  
+  gene_list <- df$log2FC_TE_final
+  names(gene_list) <- df$ENTREZID
+  head(gene_list)
+  
+  #进行基因集富集展示
+  go_gsea <- gseGO(
+    gene_list,
+    ont = "ALL",
+    OrgDb = org.Dr.eg.db,
+    keyType = "ENTREZID",
+    pvalueCutoff = 1,
+    nPermSimple = 10000,
+    pAdjustMethod = "BH",
+    eps=0)
+  print("go done")
+  
+  #KEGG
+  kegg_gsea <- gseKEGG(
+    gene_list,
+    organism = "dre",
+    pvalueCutoff = 1,
+    pAdjustMethod = "BH")
+  print("kegg done")
+  
+  #REAC
+  reac_gsea <- gsePathway(gene_list,
+                    organism = "zebrafish",
+                    nPerm = 1000, 
+                    minGSSize = 10,
+                    maxGSSize = 1000,
+                    pvalueCutoff=1)
+  print("reac done")
+  
+  #WP
+  wp_gsea <- GSEA(gene_list,TERM2GENE = wp[,c("wpid","gene")],
+              TERM2NAME = wp[,c("wpid","name")],
+              pvalueCutoff=1)
+  print("wp done")
+  
+  result <- list(go_gsea,kegg_gsea,reac_gsea,wp_gsea)
+  return(result)
+}
+
+#获取GSEA分析结果
+t61mo <- get_gsea(sheet=1)
+t6t61mo <- get_gsea(sheet=2)
+
+# 输出表格
+openxlsx::write.xlsx(t61mo, "./7_GSEA/t61mo_gsea.xlsx")
+openxlsx::write.xlsx(t6t61mo, "./7_GSEA/t6t61mo_gsea.xlsx")
+
+#绘图
+get_gsea_plot <- function(x,y){
+  for (i in 1:4){
+    temp <- x[[i]]
+    for (q in temp$ID){
+      name_index <- which(temp$ID == q)
+      if(temp$pvalue[name_index] < 0.05){
+        print(name_index)
+        
+        # windows下 ':'是非法字符，不能用于路径
+        clean_id <- gsub("[:*/?\"<>|]", "_", q)
+        filename = paste0("./7_GSEA/",y,"/",y,"_",i,"_",clean_id,".pdf")
+        
+        # 输出图片
+        pdf(file = filename, height = 5, width = 8)
+        p1 <- gseaplot2(temp, title = temp$Description[name_index], geneSetID = q ,pvalue_table = T)
+        print(p1)
+        dev.off()
+      }
+    }
+  }
+}
+
+get_gsea_plot(t61mo,"t61mo")
+get_gsea_plot(t6t61mo,"t6t61mo")
+
+```
+

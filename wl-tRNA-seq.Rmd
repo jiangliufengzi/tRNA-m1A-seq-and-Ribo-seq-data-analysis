@@ -1,0 +1,647 @@
+---
+title: "wanglu-tRNA-seq-new"
+author: "pf"
+date: "2025-05-14"
+output: html_document
+---
+
+# 0.环境准备
+```{r #setup, include=FALSE}
+knitr::opts_knit$set(root.dir = "/home/pf/2T/smrna")
+
+options(scipen = 200)
+
+library(reticulate)
+library(readxl)
+library(rmarkdown)
+library(tidyr)
+library(dplyr)
+library(rio)
+
+use_condaenv("/home/pf/miniconda3/envs/adar", required = TRUE)
+
+```
+
+# 1.数据质控
+```{bash}
+ls ./1.raw_fq/*.fastq.gz | grep "R1" | while read R1
+do
+  file=$(basename ${R1})
+  prefix=${file%%.*}
+  R2=$(echo "${R1}" | sed 's/R1/R2/g')
+  echo $R1
+  echo $R2
+  echo $prefix
+
+  fastp \
+    -i ${R1} -I ${R2} \
+    -o ./clean_R1.fq -O ./clean_R2.fq \
+    -U --umi_loc=read2 --umi_len=10 --umi_prefix UMI \
+    --adapter_sequence=AGATCGGAAGAGCACACGTCTGAACTCCAGTCA \
+    --adapter_sequence_r2=AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT \
+    -w 24 \
+    -h ${prefix}.html \
+    --length_required=20 \
+    --correction --overlap_len_require 15 \
+    --merge --merged_out ./2.rmumi_fq/${prefix}_merge.fq \
+    2> ./logs/fastp_${prefix}.log
+done
+
+# 并行化
+ls ./1.raw_fq/*.fastq.gz | grep "R1" | parallel -j 16 'R1={}; file=$(basename ${R1}); prefix=${file%%.*}; R2=$(echo "${R1}" | sed "s/R1/R2/g"); echo "Processing: $prefix"; fastp -i ${R1} -I ${R2} -o ./2.rmumi_fq/${prefix}_clean_R1.fq -O ./2.rmumi_fq/${prefix}_clean_R2.fq -U --umi_loc=read2 --umi_len=10 --umi_prefix UMI --adapter_sequence=AGATCGGAAGAGCACACGTCTGAACTCCAGTCA --adapter_sequence_r2=AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT -w 1 -h ${prefix}.html --length_required=20 --correction --overlap_len_require 15 --merge --merged_out ./2.rmumi_fq/${prefix}_merge.fq 2> ./logs/fastp_${prefix}.log'
+
+```
+
+# 2.序列方向互补
+```{bash}
+# 反向互补
+ls ./2.rmumi_fq/*.fq | grep "merge" | while read id
+do
+  file=$(basename ${id})
+  prefix=${file%%.*}
+  echo $prefix
+  
+  seqtk seq -r ${id} > ./2.rmumi_fq/${prefix}_reverse.fq
+done
+
+
+```
+
+# 3.比对
+## 3.1 bowtie
+允许两个错配
+```{bash}
+
+trna_index="0.index/grcz11_tRNA_mature_CCA_bowtie"
+
+ls ./2.rmumi_fq/*.fq | grep "reverse" | while read id
+do
+  file=$(basename ${id})
+  prefix=${file%%.*}
+  echo $prefix
+  
+  bowtie -S -p 16 --norc -v 2 -m 3 --best --strata \
+    --un ./3.bowtie/${prefix}.unmap_fq \
+    --al ./3.bowtie/${prefix}.mapped_fq \
+    -x ${trna_index} \
+    ${id} | \
+    samtools sort -O bam -o ./3.bowtie/${prefix}.bam -@ 16
+
+  samtools index ./3.bowtie/${prefix}.bam
+done
+
+```
+
+## 3.2 bwa
+```{bash}
+
+# 使用bwa进行比对
+ref_fa="./0.index/grcz11_tRNA_mature_CCA.fa"
+
+ls ./2.rmumi_fq/*.fq | grep "reverse" | while read id
+do
+  file=$(basename ${id})
+  prefix=${file%%.*}
+  echo $prefix
+  
+  bwa mem -t 16 ${ref_fa} ${id} | \
+  samtools sort -O bam -o ./3.bwa/${prefix}_bwa.bam -@ 16
+
+  samtools index ./3.bwa/${prefix}_bwa.bam
+  
+done
+
+# 表达量统计
+# samtools idxstats ./4.map_tRNA/${prefix}_bwa.bam > ./4.map_tRNA/${prefix}_idxstats.txt
+
+
+```
+
+# 4.去除重复
+## 4.1 bowtie
+```{bash}
+
+# 创建输出目录
+mkdir -p ./4.rmdup_bowtie
+mkdir -p ./logs
+
+# 遍历所有BAM文件
+for bam_file in ./3.bowtie/*.bam; do
+    # 获取文件名前缀
+    file=$(basename "$bam_file")
+    prefix="${file%%.*}"
+    
+    echo "正在处理: $prefix"
+    echo "输入文件: $bam_file"
+    
+    # 执行umi去重和排序
+    /home/pf/miniconda3/envs/trna/bin/umi_tools dedup --stdin "$bam_file" \
+        -L "./logs/rmumi_${prefix}.log" \
+        --extract-umi-method read_id \
+        --output-stats="./logs/rmumi_${prefix}.status" \
+        --method unique \
+        --umi-separator _ | samtools sort -@ 7 -O bam -o "./4.rmdup_bowtie/${prefix}.bam"
+    
+    echo "已完成: $prefix"
+    echo "-------------------------"
+    
+    # 建立索引
+    samtools index "./4.rmdup_bowtie/${prefix}.bam"
+done
+
+echo "所有bowtie BAM文件处理完成"
+
+```
+
+## 4.2 bwa
+```{bash}
+
+# 创建输出目录
+mkdir -p ./4.rmdup_bwa
+mkdir -p ./logs
+
+# 遍历所有BAM文件
+for bam_file in ./3.bwa/*.bam; do
+    # 获取文件名前缀
+    file=$(basename "$bam_file")
+    prefix="${file%%.*}"
+    
+    echo "正在处理: $prefix"
+    echo "输入文件: $bam_file"
+    
+    # 执行umi去重和排序
+    # /home/pf/miniconda3/envs/trna/bin/
+    /home/pf/miniconda3/envs/trna/bin/umi_tools dedup --stdin "$bam_file" \
+        -L "./logs/rmumi_${prefix}.log" \
+        --extract-umi-method read_id \
+        --output-stats="./logs/rmumi_${prefix}.status" \
+        --method unique \
+        --umi-separator _ | samtools sort -@ 7 -O bam -o "./4.rmdup_bwa/${prefix}.bam"
+    
+    echo "已完成: $prefix"
+    echo "-------------------------"
+    
+    # 构建索引
+    samtools index "./4.rmdup_bwa/${prefix}.bam"
+    
+    echo "索引已完成: $prefix"
+    echo "-------------------------"
+done
+
+echo "所有文件处理完成"
+
+```
+
+# 5.表达量计数-bowtie
+```{bash}
+
+ls ./4.rmdup_bowtie/*.bam | while read id
+do
+  file=$(basename ${id})
+  prefix=${file%%.*}
+  echo $prefix
+  
+  samtools view -F 4 ${id} | \
+        awk '{{print $3}}' | sort | uniq -c | sort > ./5.bowtie_count/${prefix}.txt
+done
+
+```
+
+合并表达量数据
+```{r}
+library(dplyr)
+library(tidyr)
+library(stringr)
+all_file <- list()
+
+# 读取所有tRNA名
+df <- read.table("./0.index/seqname.txt", header = T)
+
+file_list <- list.files("./5.bowtie_count", pattern = "*.txt", full.names = T)
+
+for (file in file_list) {
+  # 读取文件
+  df1 <- read.table(file, header = F)
+  
+  # 提取文件名前缀
+  file_name <- basename(file)
+  prefix <- str_split(file_name, "_") %>% unlist() %>% .[2]
+  colnames(df1) <- c(prefix, "seq_name")
+  
+  # 合并数据
+  df <- left_join(df, df1, by = "seq_name")
+  
+}
+
+# 替换NA为0
+df[is.na(df)] <- 0
+
+colnames(df) <- c("seq_name", "ctr_1", "t6mo_1", "t61mo_1", "t6t61mo_1",
+                              "ctr_1a", "t6mo_1a", "t61mo_1a", "t6t61mo_1a",
+                              "ctr_2", "t6mo_2", "t61mo_2", "t6t61mo_2",
+                              "ctr_2a", "t6mo_2a", "t61mo_2a", "t6t61mo_2a")
+
+tRNA_count <- df
+all_file[["tRNA_count"]] <- tRNA_count
+
+```
+
+转化为CPM
+```{r}
+tRNA_cpm <- data.frame(seq_name = tRNA_count$seq_name,
+                       apply(tRNA_count[,2:ncol(tRNA_count)], 2, function(x) x/sum(x)*1000000))
+
+all_file[["tRNA_cpm"]] <- tRNA_cpm
+
+```
+
+合并相同密码子的变体-isoform
+```{r}
+
+tRNA_cpm$seq_name <- gsub("Danio_rerio_tRNA-","",tRNA_cpm$seq_name)
+
+tRNA_cpm <- tRNA_cpm %>% separate(seq_name,into=c("animo", "codon", "num1","num2"),sep = "-") %>% 
+  tidyr::unite("seq_name", animo, codon) %>%
+  dplyr::filter(!grepl("NNN", seq_name)) %>%
+  dplyr::select(-c(num1, num2)) %>%
+  dplyr::group_by(seq_name) %>%
+  dplyr::summarise(
+    "ctr_1" = sum(ctr_1),
+    "t6mo_1" = sum(t6mo_1),
+    "t61mo_1" = sum(t61mo_1),
+    "t6t61mo_1" = sum(t6t61mo_1),
+    "ctr_1a" = sum(ctr_1a),
+    "t6mo_1a" = sum(t6mo_1a),
+    "t61mo_1a" = sum(t61mo_1a),
+    "t6t61mo_1a" = sum(t6t61mo_1a),
+    "ctr_2" = sum(ctr_2),
+    "t6mo_2" = sum(t6mo_2),
+    "t61mo_2" = sum(t61mo_2),
+    "t6t61mo_2" = sum(t6t61mo_2),
+    "ctr_2a" = sum(ctr_2a),
+    "t6mo_2a" = sum(t6mo_2a),
+    "t61mo_2a" = sum(t61mo_2a),
+    "t6t61mo_2a" = sum(t6t61mo_2a)
+  )
+
+tRNA_cpm$seq_name <- gsub("Sup","Stop",tRNA_cpm$seq_name)
+
+all_file[["tRNA_cpm_merge_isoform"]] <- tRNA_cpm
+
+
+
+```
+
+
+## 5.1 tRNA表达量差异分析
+```{r}
+
+source("scripts/plot_diff_tRNA_exp.R")
+
+# no alkb treat
+plot_diff_tRNA_exp(input_file="./7.plot/all_tRNA_mutation.xlsx", sheet=7, 
+                               control1="ctr_1", control2="ctr_2", 
+                               treat1="t6mo_1", treat2="t6mo_2",
+                               cut_log2FC=1, cut_pvalue=0.05,
+                               out_file="t6mo")
+
+plot_diff_tRNA_exp(input_file="./7.plot/all_tRNA_mutation.xlsx", sheet=7,
+                               control1="ctr_1", control2="ctr_2", 
+                               treat1="t61mo_1", treat2="t61mo_2",
+                               cut_log2FC=1, cut_pvalue=0.05,
+                               out_file="t61mo")
+
+plot_diff_tRNA_exp(input_file="./7.plot/all_tRNA_mutation.xlsx", sheet=7,
+                               control1="ctr_1", control2="ctr_2", 
+                               treat1="t6t61mo_1", treat2="t6t61mo_2",
+                               cut_log2FC=1, cut_pvalue=0.05,
+                               out_file="t6t61mo")
+
+# alkb处理组
+plot_diff_tRNA_exp(input_file="./7.plot/all_tRNA_mutation.xlsx", sheet=7,
+                               control1="ctr_1a", control2="ctr_2a", 
+                               treat1="t6mo_1a", treat2="t6mo_2a",
+                               cut_log2FC=1, cut_pvalue=0.05,
+                               out_file="t6mo_a")
+
+plot_diff_tRNA_exp(input_file="./7.plot/all_tRNA_mutation.xlsx", sheet=7,
+                               control1="ctr_1a", control2="ctr_2a", 
+                               treat1="t61mo_1a", treat2="t61mo_2a",
+                               cut_log2FC=1, cut_pvalue=0.05,
+                               out_file="t61mo_a")
+
+plot_diff_tRNA_exp(input_file="./7.plot/all_tRNA_mutation.xlsx", sheet=7,
+                               control1="ctr_1a", control2="ctr_2a", 
+                               treat1="t6t61mo_1a", treat2="t6t61mo_2a",
+                               cut_log2FC=1, cut_pvalue=0.05,
+                               out_file="t6t61mo_a")
+
+# 合并 alkb 和 no alkb处理组
+plot_diff_tRNA_exp_multi(input_file="./7.plot/all_tRNA_mutation.xlsx", sheet=7, 
+                               control1="ctr_1", control2="ctr_2", control3="ctr_1a", control4="ctr_2a",
+                               treat1="t6mo_1", treat2="t6mo_2", treat3="t6mo_1a", treat4="t6mo_2a",
+                               cut_log2FC=1, cut_pvalue=0.05,
+                               out_file="t6mo_alkb_noalkb")
+
+plot_diff_tRNA_exp_multi(input_file="./7.plot/all_tRNA_mutation.xlsx", sheet=7,
+                               control1="ctr_1", control2="ctr_2", control3="ctr_1a", control4="ctr_2a",
+                               treat1="t61mo_1", treat2="t61mo_2", treat3="t61mo_1a", treat4="t61mo_2a",
+                               cut_log2FC=1, cut_pvalue=0.05,
+                               out_file="t61mo_alkb_noalkb")
+
+plot_diff_tRNA_exp_multi(input_file="./7.plot/all_tRNA_mutation.xlsx", sheet=7,
+                               control1="ctr_1", control2="ctr_2", control3="ctr_1a", control4="ctr_2a",
+                               treat1="t6t61mo_1", treat2="t6t61mo_2", treat3="t6t61mo_1a", treat4="t6t61mo_2a",
+                               cut_log2FC=1, cut_pvalue=0.05,
+                               out_file="t6t61mo_alkb_noalkb")
+
+
+```
+
+
+# 6.突变统计-bwa
+## 6.1 samtools统计突变
+```{bash}
+
+trna_fa="./0.index/grcz11_tRNA_mature_CCA.fa"
+
+ls ./4.rmdup_bwa/*.bam | while read id
+do
+  file=$(basename ${id})
+  prefix=${file%%.*}
+  echo $prefix
+  
+  samtools mpileup -B -Q 0 -q 0 -f ${trna_fa} ${id} | awk 'BEGIN {OFS="\t"} {
+
+    # 提取关键信息
+    chr = $1
+    pos = $2
+    ref_base = $3
+    depth = $4
+    bases = $5
+
+    # 初始化碱基计数
+    split("ACGTN", base_types, "")
+    for (i in base_types) count[base_types[i]] = 0
+
+    # 初始化匹配参考碱基的计数
+    match_count = 0
+
+    # 统计每个碱基的出现次数
+    for (i = 1; i <= length(bases); i++) {
+        base = substr(bases, i, 1)
+
+        # 处理碱基类型 (区分大小写)
+        if (base ~ /[acgtn]/) {
+            base = toupper(base)
+        } else if (base == "*") {
+            base = "N"  # 将缺失碱基标记为 N
+        }
+
+        # 忽略插入和删除，但保留所有碱基 (包括低质量碱基)
+        if (base != "+" && base != "-") {
+            count[base]++
+            # 增加对与参考碱基匹配的计数
+            if (base == ref_base) {
+                match_count++
+            }
+        }
+    }
+
+    # 输出结果
+    printf "%s\t%s\t%s\t%d", chr, pos, ref_base, depth
+    for (i in base_types) {
+        printf "\t%d", count[base_types[i]]
+    }
+    # 输出与参考碱基匹配的计数
+    printf "\t%d", match_count
+    print ""
+  }' > ./5.bwa_mutation/${prefix}.txt
+done
+
+```
+
+## 6.2 筛选突变位点并合并
+检测到的tRNA变体
+```{r}
+# 测到的tRNA目录
+files <- list.files(path = "./5.bwa_mutation/", pattern = "*.txt")
+
+name_list <- c()
+
+for (i in files){
+  file_path <- paste0("./5.bwa_mutation/",i)
+  df <- rio::import(file_path,header = F)
+  df <- df %>% filter(V2 > 55 & V2 < 61) %>% filter(V3 == "A")
+  df$seq_name <- paste(df$V1, df$V2, sep = "_")
+  name <- as.vector(df$seq_name)
+  name_list <- c(name_list,name)
+}
+
+all_trna <- data.frame(seqname=unique(name_list))
+
+```
+
+统计突变并合并
+```{r}
+
+files <- list.files(path = "./5.bwa_mutation/", pattern = "*.txt")
+
+n=1
+
+for (i in files){
+  file_path <- paste0("./5.bwa_mutation/",i)
+  df <- rio::import(file_path,header = F)[,-10]
+  colnames(df) <- c("seq_name","position","ref", "depth", "A", "C", "G", "T", "N")
+  
+  df$A <- df$depth - rowSums(df[,c("C","G","T","N")])
+  
+  df <- df %>% filter(position>55 & position<61) %>% filter(ref == "A")
+  df <- df %>% dplyr::select(-N)
+  
+  df$depth <- rowSums(df[,c("A","C","G","T")])
+  
+  df$mutation <- rowSums(df[,c("C","G","T")])/df$depth
+  
+  df$seqname <- paste(df$seq_name, df$position, sep = "_")
+  
+  df <- df %>% select(c(seqname, depth, mutation))
+  colnames(df) <- c("seqname", paste0(n, "_depth"), paste0(n, "_mutation"))
+  
+  all_trna <- dplyr::left_join(all_trna, df, by="seqname")
+  
+  n = n + 1
+  
+}
+
+all_trna[is.na(all_trna)]=0
+export(all_trna,file = "all_mutation.txt")
+
+all_file[["tRNA_mutation"]] <- all_trna
+
+```
+
+# 7. 合并密码子变体
+```{r}
+library(readxl)
+library(dplyr)
+options(stringsAsFactors = F)
+
+prepare_df <- data.frame(
+  amino_acid_codon = character(),
+  X1_depth = numeric(),
+  X1_mutation = numeric(),
+  X2_depth = numeric(),
+  X2_mutation = numeric(),
+  X3_depth = numeric(),
+  X3_mutation = numeric(),
+  X4_depth = numeric(),
+  X4_mutation = numeric(),
+  X9_depth = numeric(),
+  X9_mutation = numeric(),
+  X10_depth = numeric(),
+  X10_mutation = numeric(),
+  X11_depth = numeric(),
+  X11_mutation = numeric(),
+  X12_depth = numeric(),
+  X12_mutation = numeric()
+)
+
+data <- read.table("all_mutation.txt", header = T, sep = "\t", stringsAsFactors = F)
+
+data <- data %>%
+  mutate(across(contains("depth"), as.numeric)) %>%
+  mutate(seqname = gsub("Danio_rerio_tRNA-", "", seqname)) %>%
+  tidyr::separate(seqname,
+                  c("amino_acid", "codon", "num1", "num2", "position"),
+                  sep = "_|-", 
+                  remove = F) %>%
+  dplyr::filter(X1_mutation > 0.1) %>%
+  dplyr::select(-c(15:22,31:38)) %>%
+  mutate(amino_acid_codon = paste(amino_acid, codon, sep = "_")) %>% 
+  mutate(depth_sum = rowSums(select(., contains("depth")))) %>% 
+  dplyr::filter(depth_sum > 80) %>% 
+  dplyr::select(-depth_sum)
+
+df <- data %>% 
+  dplyr::select(-c(1:6)) %>% 
+  dplyr::select(amino_acid_codon, everything()) %>%
+  group_by(amino_acid_codon)
+
+codon <- table(df$amino_acid_codon) %>% as.data.frame() %>% 
+  dplyr::pull(1)
+
+for(i in codon){
+  tmp_df <- df %>% filter(amino_acid_codon == i)
+  V1 = i
+  V2 = sum(tmp_df$X1_depth)
+  V3 = sum(tmp_df$X1_depth * tmp_df$X1_mutation) / sum(tmp_df$X1_depth)
+  V4 = sum(tmp_df$X2_depth)
+  V5 = sum(tmp_df$X2_depth * tmp_df$X2_mutation) / sum(tmp_df$X2_depth)
+  V6 = sum(tmp_df$X3_depth)
+  V7 = sum(tmp_df$X3_depth * tmp_df$X3_mutation) / sum(tmp_df$X3_depth)
+  V8 = sum(tmp_df$X4_depth)
+  V9 = sum(tmp_df$X4_depth * tmp_df$X4_mutation) / sum(tmp_df$X4_depth)
+  V10 = sum(tmp_df$X9_depth)
+  V11 = sum(tmp_df$X9_depth * tmp_df$X9_mutation) / sum(tmp_df$X9_depth)
+  V12 = sum(tmp_df$X10_depth)
+  V13 = sum(tmp_df$X10_depth * tmp_df$X10_mutation) / sum(tmp_df$X10_depth)
+  V14 = sum(tmp_df$X11_depth)
+  V15 = sum(tmp_df$X11_depth * tmp_df$X11_mutation) / sum(tmp_df$X11_depth)
+  V16 = sum(tmp_df$X12_depth)
+  V17 = sum(tmp_df$X12_depth * tmp_df$X12_mutation) / sum(tmp_df$X12_depth)
+  
+  prepare_df <- rbind(prepare_df, data.frame(V1, V2, V3, V4, V5,
+                                             V6, V7, V8, V9, V10,
+                                             V11, V12, V13, V14, V15, V16, V17))
+}
+
+colnames(prepare_df) <- c("amino_acid_codon", 
+                          "ctr_1_depth", "ctr_1_mutation",
+                          "t6mo_1_depth", "t6mo_1_mutation",
+                          "t61mo_1_depth", "t61mo_1_mutation",
+                          "t6t61mo_1_depth", "t6t61mo_1_mutation",
+                          "ctr_2_depth", "ctr_2_mutation",
+                          "t6mo_2_depth", "t6mo_2_mutation",
+                          "t61mo_2_depth", "t61mo_2_mutation",
+                          "t6t61mo_2_depth", "t6t61mo_2_mutation")
+
+all_file[["mutation_merge"]] <- prepare_df
+
+# 输出合并变体之后的突变率
+# rio::export(prepare_df, file = "trna_mutation_merge_all_tRNA_isoform.txt")
+
+```
+
+7.1 ## 计算差异
+```{r}
+
+prepare_df$t6mo_mean_diff <- ((prepare_df$ctr_1_mutation - prepare_df$t6mo_1_mutation) +
+                               (prepare_df$ctr_2_mutation - prepare_df$t6mo_2_mutation)) / 2
+
+prepare_df$t61mo_mean_diff <- ((prepare_df$ctr_1_mutation - prepare_df$t61mo_1_mutation) +
+                                  (prepare_df$ctr_2_mutation - prepare_df$t61mo_2_mutation)) / 2
+
+prepare_df$t6t61mo_mean_diff <- ((prepare_df$ctr_1_mutation - prepare_df$t6t61mo_1_mutation) +
+                                     (prepare_df$ctr_2_mutation - prepare_df$t6t61mo_2_mutation)) / 2
+
+prepare_df <- prepare_df %>% dplyr::filter(!amino_acid_codon %in% c("Ala_GGC", "Ile_GAT", "Ser_TGA", "Und_NNN"))
+
+
+all_file[["mutation_merge_filter_mean"]] <- prepare_df
+
+```
+
+## 全部输出
+```{r}
+library(openxlsx)
+
+write.xlsx(all_file, file = "all_tRNA_mutation.xlsx", asTable = T)
+```
+
+# 8. 合并密码子变体后绘制突变率图
+```{r}
+
+source("scripts/plot_tRNA_mutation.R")
+
+plot_tRNA_mutation(input_file="./7.plot/all_tRNA_mutation.xlsx", sheet=6, treat = "t6mo_mean_diff")
+plot_tRNA_mutation(input_file="./7.plot/all_tRNA_mutation.xlsx", sheet=6, treat = "t61mo_mean_diff")
+plot_tRNA_mutation(input_file="./7.plot/all_tRNA_mutation.xlsx", sheet=6, treat = "t6t61mo_mean_diff")
+
+```
+
+
+# 9. tRNA fragment
+
+
+
+# 10. 表达量分析
+```{r}
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
